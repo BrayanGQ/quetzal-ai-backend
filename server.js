@@ -1,20 +1,12 @@
 /**
  * Quetzal AI — Servidor Backend
  *
- * Backend independiente. Se despliega en Render.com (gratis).
- * El frontend hace fetch a este servidor por su URL pública.
- *
  * Endpoints:
- *   GET  /api/health                → estado del servidor
- *   POST /api/generate              → genera contenido con IA (Llama 3.3 vía Groq)
- *   POST /api/chat                  → chatbot con IA, recibe info del negocio
- *   POST /api/analizar-ventas       → análisis automático de ventas con IA
- *
- * Variables de entorno requeridas (.env):
- *   GROQ_API_KEY     - Conseguir gratis en https://console.groq.com/keys
- *   GROQ_MODEL       - Modelo (default: llama-3.3-70b-versatile)
- *   PORT             - Puerto (default: 3000)
- *   ALLOWED_ORIGINS  - URLs del frontend separadas por coma (CORS)
+ *   GET  /api/health              → estado del servidor
+ *   POST /api/generate            → genera contenido con IA (Llama 3.3 vía Groq)
+ *   POST /api/chat                → chatbot con IA, recibe info del negocio
+ *   POST /api/analizar-ventas     → análisis automático de ventas con IA
+ *   POST /api/generar-imagen      → genera imagen con Flux (Cloudflare Workers AI)
  *
  * @author Brayan Alexander Gómez Quex
  */
@@ -25,24 +17,31 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Groq (texto)
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Validación al arranque
+// Cloudflare Workers AI (imágenes con Flux)
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
+const CF_API_TOKEN = process.env.CF_API_TOKEN;
+const CF_IMAGE_MODEL = process.env.CF_IMAGE_MODEL || '@cf/black-forest-labs/flux-1-schnell';
+
 if (!GROQ_API_KEY) {
-  console.error('\n❌ ERROR: Falta GROQ_API_KEY en el archivo .env');
-  console.error('   1. Copiá .env.example a .env');
-  console.error('   2. Conseguí tu key gratis en https://console.groq.com/keys');
-  console.error('   3. Pegala en .env\n');
+  console.error('\n❌ ERROR: Falta GROQ_API_KEY en el archivo .env\n');
   process.exit(1);
 }
 
-// ============ CORS — solo permitir el frontend ============
-// En producción, configurar ALLOWED_ORIGINS con la URL real de Vercel
+if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+  console.warn('\n⚠️  Aviso: Falta CF_ACCOUNT_ID o CF_API_TOKEN — la generación de imágenes no funcionará');
+  console.warn('   Conseguilos en: https://dash.cloudflare.com/profile/api-tokens\n');
+}
+
+// ============ CORS ============
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['*'];  // En desarrollo permite cualquier origen
+  : ['*'];
 
 app.use(cors({
   origin: allowedOrigins.includes('*') ? true : allowedOrigins,
@@ -53,21 +52,10 @@ app.use(cors({
 app.use(express.json({ limit: '500kb' }));
 
 
-// ============ HELPER: llamada a Groq ============
-
-/**
- * Llama a la API de Groq con un system prompt y mensajes
- * @param {string} systemPrompt - Instrucciones de contexto
- * @param {string|Array} userInput - Mensaje del usuario o array de mensajes
- * @param {number} maxTokens - Tokens máximos en la respuesta
- * @param {number} temperature - Creatividad (0-1)
- */
+// ============ HELPER: Groq (texto) ============
 async function callGroq(systemPrompt, userInput, maxTokens = 500, temperature = 0.8) {
-  const messages = [
-    { role: 'system', content: systemPrompt }
-  ];
+  const messages = [{ role: 'system', content: systemPrompt }];
 
-  // userInput puede ser string (un mensaje) o array (historial)
   if (typeof userInput === 'string') {
     messages.push({ role: 'user', content: userInput });
   } else if (Array.isArray(userInput)) {
@@ -98,29 +86,66 @@ async function callGroq(systemPrompt, userInput, maxTokens = 500, temperature = 
 }
 
 
-// ============ ENDPOINT: Health check ============
+// ============ HELPER: Cloudflare Workers AI (imágenes) ============
+async function generateImageCloudflare(prompt) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+    throw new Error('Cloudflare no configurado en el servidor');
+  }
 
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CF_API_TOKEN}`
+    },
+    body: JSON.stringify({
+      prompt: prompt,
+      num_steps: 4,        // Flux Schnell funciona mejor con 4 pasos
+      width: 1024,
+      height: 1024
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Cloudflare AI error ${response.status}: ${errorText}`);
+  }
+
+  const data = await response.json();
+
+  // Cloudflare devuelve la imagen en base64 dentro de result.image
+  if (data.success && data.result && data.result.image) {
+    return `data:image/png;base64,${data.result.image}`;
+  }
+
+  throw new Error('Respuesta inesperada de Cloudflare AI');
+}
+
+
+// ============ ENDPOINT: Health check ============
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'Quetzal AI Backend',
-    model: GROQ_MODEL,
+    text_model: GROQ_MODEL,
+    image_model: CF_IMAGE_MODEL,
+    image_enabled: !!(CF_ACCOUNT_ID && CF_API_TOKEN),
     timestamp: new Date().toISOString()
   });
 });
 
-// Ruta raíz para que Render no marque error
 app.get('/', (req, res) => {
   res.json({
     service: 'Quetzal AI Backend',
     status: 'running',
-    docs: 'POST /api/generate, POST /api/chat, POST /api/analizar-ventas'
+    docs: 'POST /api/generate, POST /api/chat, POST /api/analizar-ventas, POST /api/generar-imagen'
   });
 });
 
 
-// ============ ENDPOINT 1: Generador de contenido ============
-
+// ============ ENDPOINT 1: Generador de contenido (texto) ============
 app.post('/api/generate', async (req, res) => {
   try {
     const { type, tone, prompt } = req.body;
@@ -177,7 +202,6 @@ Reglas:
 
 
 // ============ ENDPOINT 2: Chatbot ============
-
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, businessInfo, history } = req.body;
@@ -186,7 +210,6 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'El campo message es obligatorio' });
     }
 
-    // Información del negocio por defecto (si no llega del frontend)
     const defaultBusinessInfo = {
       name: 'Tienda Don José',
       type: 'tienda de abarrotes',
@@ -205,7 +228,6 @@ app.post('/api/chat', async (req, res) => {
 
     const info = businessInfo || defaultBusinessInfo;
 
-    // Convertir productos a string si llegan como array
     const productsList = Array.isArray(info.products)
       ? info.products.map(p => `  · ${p}`).join('\n')
       : (info.products || '').split('\n').map(p => `  · ${p.trim()}`).join('\n');
@@ -227,7 +249,6 @@ Instrucciones para responder:
 - No inventes información que no esté en el contexto (precios, horarios, productos que no existan).
 - Terminá ofreciéndote para ayudar en algo más cuando sea natural hacerlo.`;
 
-    // Si hay historial, mandarlo. Si no, solo el mensaje actual
     const userInput = (history && Array.isArray(history) && history.length > 0)
       ? [...history, { role: 'user', content: message }]
       : message;
@@ -251,11 +272,10 @@ Instrucciones para responder:
 });
 
 
-// ============ ENDPOINT 3: Análisis automático de ventas ============
-
+// ============ ENDPOINT 3: Análisis de ventas ============
 app.post('/api/analizar-ventas', async (req, res) => {
   try {
-    const { sales, summary } = req.body;
+    const { sales } = req.body;
 
     if (!sales || !Array.isArray(sales) || sales.length === 0) {
       return res.status(400).json({ error: 'Se requiere un array de ventas' });
@@ -268,7 +288,6 @@ app.post('/api/analizar-ventas', async (req, res) => {
       });
     }
 
-    // Construir un resumen estructurado de las ventas para la IA
     const totalRevenue = sales.reduce((sum, s) => sum + (s.qty * s.price), 0);
     const productCount = {};
     const dayCount = {};
@@ -278,7 +297,6 @@ app.post('/api/analizar-ventas', async (req, res) => {
       const date = new Date(s.date);
       const day = date.toLocaleDateString('es-GT', { weekday: 'long' });
       const hour = date.getHours();
-
       productCount[s.product] = (productCount[s.product] || 0) + s.qty;
       dayCount[day] = (dayCount[day] || 0) + (s.qty * s.price);
       hourCount[hour] = (hourCount[hour] || 0) + (s.qty * s.price);
@@ -322,31 +340,23 @@ REGLAS DE FORMATO:
 - Cada insight debe ser 1-2 oraciones, máximo 30 palabras.
 - Cada insight debe empezar con un emoji relevante (💡 📈 🎯 ⏰ 🔥 ⚠️ 💰 etc.)
 - Habla en español de Guatemala, segunda persona ("tu negocio", "podés").
-- Sé específico con números y datos del análisis (no genérico).
-- Da insights ACCIONABLES, no solo observaciones (ej: "considerá hacer X" o "podrías Y").
+- Sé específico con números y datos del análisis.
+- Da insights ACCIONABLES, no solo observaciones.
 
 FORMATO DE RESPUESTA (JSON estricto):
 {
-  "insights": [
-    "💡 Texto del insight 1...",
-    "📈 Texto del insight 2...",
-    "🎯 Texto del insight 3..."
-  ]
+  "insights": ["💡 ...", "📈 ...", "🎯 ..."]
 }
 
-Responde SOLO el JSON, sin texto adicional, sin markdown, sin \`\`\`.`;
+Responde SOLO el JSON, sin texto adicional, sin markdown.`;
 
     const aiResponse = await callGroq(systemPrompt, dataString, 500, 0.6);
 
-    // Intentar parsear el JSON
     let parsed;
     try {
-      // Limpiar posibles backticks o markdown
       const cleaned = aiResponse.replace(/```json|```/g, '').trim();
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      // Si falla el JSON, devolver el texto crudo dividido en líneas
-      console.warn('[WARN] No se pudo parsear JSON, usando fallback');
       parsed = {
         insights: aiResponse.split('\n').filter(l => l.trim().length > 10).slice(0, 3)
       };
@@ -369,24 +379,53 @@ Responde SOLO el JSON, sin texto adicional, sin markdown, sin \`\`\`.`;
 });
 
 
-// ============ ARRANQUE ============
+// ============ ENDPOINT 4: Generar imagen con Flux ============
+app.post('/api/generar-imagen', async (req, res) => {
+  try {
+    const { prompt } = req.body;
 
+    if (!prompt || !prompt.trim()) {
+      return res.status(400).json({ error: 'El campo prompt es obligatorio' });
+    }
+
+    // Mejorar el prompt automáticamente para resultados más profesionales
+    const enhancedPrompt = `${prompt}, professional food photography, instagram style, natural lighting, mouth-watering, high quality, sharp details, vibrant colors, appetizing, soft bokeh background`;
+
+    const imageDataUrl = await generateImageCloudflare(enhancedPrompt);
+
+    res.json({
+      success: true,
+      image: imageDataUrl,
+      model: CF_IMAGE_MODEL
+    });
+
+  } catch (error) {
+    console.error('[ERROR /api/generar-imagen]', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'No se pudo generar la imagen. Intenta de nuevo.',
+      details: error.message
+    });
+  }
+});
+
+
+// ============ ARRANQUE ============
 app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════╗
-║                                                        ║
 ║         🦜  QUETZAL AI — Backend Iniciado              ║
 ║                                                        ║
-║    Puerto:    ${String(PORT).padEnd(43)}║
-║    Modelo:    ${GROQ_MODEL.padEnd(43)}║
-║    CORS:      ${allowedOrigins.join(', ').substring(0, 41).padEnd(43)}║
+║    Puerto:  ${String(PORT).padEnd(45)}║
+║    Texto:   ${GROQ_MODEL.padEnd(45)}║
+║    Imagen:  ${(CF_IMAGE_MODEL).padEnd(45)}║
 ║                                                        ║
 ║    Endpoints:                                          ║
 ║      GET  /api/health                                  ║
 ║      POST /api/generate                                ║
 ║      POST /api/chat                                    ║
 ║      POST /api/analizar-ventas                         ║
-║                                                        ║
+║      POST /api/generar-imagen                          ║
 ╚════════════════════════════════════════════════════════╝
   `);
 });
