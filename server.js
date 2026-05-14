@@ -6,6 +6,8 @@
  *   POST /api/generate            → genera contenido con IA (Llama 3.3 vía Groq)
  *   POST /api/chat                → chatbot con IA, recibe info del negocio
  *   POST /api/analizar-ventas     → análisis automático de ventas con IA
+ *   POST /api/predecir-ventas     → predicción de ventas próximos 7 días
+ *   POST /api/consejos-negocio    → plan de acción personalizado con IA
  *   POST /api/generar-imagen      → genera imagen con Flux (Cloudflare Workers AI)
  *
  * @author Brayan Alexander Gómez Quex
@@ -34,8 +36,7 @@ if (!GROQ_API_KEY) {
 }
 
 if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
-  console.warn('\n⚠️  Aviso: Falta CF_ACCOUNT_ID o CF_API_TOKEN — la generación de imágenes no funcionará');
-  console.warn('   Conseguilos en: https://dash.cloudflare.com/profile/api-tokens\n');
+  console.warn('\n⚠️  Aviso: Falta CF_ACCOUNT_ID o CF_API_TOKEN — la generación de imágenes no funcionará\n');
 }
 
 // ============ CORS ============
@@ -102,7 +103,7 @@ async function generateImageCloudflare(prompt) {
     },
     body: JSON.stringify({
       prompt: prompt,
-      num_steps: 4,        // Flux Schnell funciona mejor con 4 pasos
+      num_steps: 4,
       width: 1024,
       height: 1024
     })
@@ -115,7 +116,6 @@ async function generateImageCloudflare(prompt) {
 
   const data = await response.json();
 
-  // Cloudflare devuelve la imagen en base64 dentro de result.image
   if (data.success && data.result && data.result.image) {
     return `data:image/png;base64,${data.result.image}`;
   }
@@ -124,7 +124,7 @@ async function generateImageCloudflare(prompt) {
 }
 
 
-// ============ ENDPOINT: Health check ============
+// ============ Health check ============
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -140,7 +140,7 @@ app.get('/', (req, res) => {
   res.json({
     service: 'Quetzal AI Backend',
     status: 'running',
-    docs: 'POST /api/generate, POST /api/chat, POST /api/analizar-ventas, POST /api/generar-imagen'
+    docs: 'POST /api/generate, POST /api/chat, POST /api/analizar-ventas, POST /api/predecir-ventas, POST /api/consejos-negocio, POST /api/generar-imagen'
   });
 });
 
@@ -184,11 +184,7 @@ Reglas:
 
     const aiResponse = await callGroq(systemPrompt, prompt, 400);
 
-    res.json({
-      success: true,
-      content: aiResponse,
-      model: GROQ_MODEL
-    });
+    res.json({ success: true, content: aiResponse, model: GROQ_MODEL });
 
   } catch (error) {
     console.error('[ERROR /api/generate]', error.message);
@@ -255,11 +251,7 @@ Instrucciones para responder:
 
     const aiResponse = await callGroq(systemPrompt, userInput, 300, 0.7);
 
-    res.json({
-      success: true,
-      response: aiResponse,
-      model: GROQ_MODEL
-    });
+    res.json({ success: true, response: aiResponse, model: GROQ_MODEL });
 
   } catch (error) {
     console.error('[ERROR /api/chat]', error.message);
@@ -362,11 +354,7 @@ Responde SOLO el JSON, sin texto adicional, sin markdown.`;
       };
     }
 
-    res.json({
-      success: true,
-      insights: parsed.insights || [],
-      model: GROQ_MODEL
-    });
+    res.json({ success: true, insights: parsed.insights || [], model: GROQ_MODEL });
 
   } catch (error) {
     console.error('[ERROR /api/analizar-ventas]', error.message);
@@ -379,7 +367,183 @@ Responde SOLO el JSON, sin texto adicional, sin markdown.`;
 });
 
 
-// ============ ENDPOINT 4: Generar imagen con Flux ============
+// ============ ENDPOINT 4: Predicción de ventas (NUEVO) ============
+app.post('/api/predecir-ventas', async (req, res) => {
+  try {
+    const { sales } = req.body;
+
+    if (!sales || !Array.isArray(sales) || sales.length === 0) {
+      return res.status(400).json({ error: 'Se requiere un array de ventas' });
+    }
+
+    if (sales.length < 5) {
+      return res.status(400).json({
+        error: 'Se requieren al menos 5 ventas para hacer una predicción confiable',
+        success: false
+      });
+    }
+
+    const totalRevenue = sales.reduce((sum, s) => sum + (s.qty * s.price), 0);
+    const avgTicket = totalRevenue / sales.length;
+    const productCount = {};
+    const dayCount = {};
+    const hourCount = {};
+
+    sales.forEach(s => {
+      const date = new Date(s.date);
+      const day = date.toLocaleDateString('es-GT', { weekday: 'long' });
+      const hour = date.getHours();
+      productCount[s.product] = (productCount[s.product] || 0) + s.qty;
+      dayCount[day] = (dayCount[day] || 0) + (s.qty * s.price);
+      hourCount[hour] = (hourCount[hour] || 0) + (s.qty * s.price);
+    });
+
+    const topProduct = Object.entries(productCount).sort((a, b) => b[1] - a[1])[0];
+    const topDay = Object.entries(dayCount).sort((a, b) => b[1] - a[1])[0];
+    const topHour = Object.entries(hourCount).sort((a, b) => b[1] - a[1])[0];
+    const avgPerDay = totalRevenue / 7;
+
+    const summary = `DATOS HISTÓRICOS DEL NEGOCIO:
+- Total de ventas analizadas: ${sales.length}
+- Ingresos totales (últimos 7 días): Q ${totalRevenue.toFixed(2)}
+- Promedio diario actual: Q ${avgPerDay.toFixed(2)}
+- Ticket promedio: Q ${avgTicket.toFixed(2)}
+- Producto más vendido: ${topProduct[0]} (${topProduct[1]} unidades)
+- Día con más ingresos: ${topDay[0]} (Q ${topDay[1].toFixed(2)})
+- Hora pico: ${topHour[0]}:00 (Q ${topHour[1].toFixed(2)})`;
+
+    const systemPrompt = `Eres un analista experto en proyección de ventas para PYMES de Guatemala. Basándote en el histórico que se te proporciona, genera una predicción para los PRÓXIMOS 7 DÍAS.
+
+REGLAS:
+- Sé realista con los números. Si el histórico tiene poca data, tu rango debe ser amplio.
+- Habla en español de Guatemala, segunda persona ("tu negocio", "vas a", "podés").
+- Sé específico con números, productos y días del histórico.
+
+FORMATO DE RESPUESTA (JSON estricto, sin markdown, sin backticks):
+{
+  "ingresos_min": 580,
+  "ingresos_max": 720,
+  "dia_mas_fuerte": "Viernes",
+  "producto_estrella": "Refresco natural piña",
+  "hora_pico": "16:00 - 18:00",
+  "recomendacion": "Una recomendación accionable de 1-2 oraciones que ayude al dueño a maximizar ese pronóstico."
+}
+
+Responde SOLO el JSON.`;
+
+    const aiResponse = await callGroq(systemPrompt, summary, 500, 0.5);
+
+    let parsed;
+    try {
+      const cleaned = aiResponse.replace(/```json|```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      parsed = {
+        ingresos_min: Math.round(totalRevenue * 0.85),
+        ingresos_max: Math.round(totalRevenue * 1.15),
+        dia_mas_fuerte: topDay[0],
+        producto_estrella: topProduct[0],
+        hora_pico: `${topHour[0]}:00`,
+        recomendacion: aiResponse.slice(0, 200)
+      };
+    }
+
+    res.json({ success: true, prediction: parsed, model: GROQ_MODEL });
+
+  } catch (error) {
+    console.error('[ERROR /api/predecir-ventas]', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'No se pudo generar la predicción. Intenta de nuevo.',
+      details: error.message
+    });
+  }
+});
+
+
+// ============ ENDPOINT 5: Consejos personalizados (NUEVO) ============
+app.post('/api/consejos-negocio', async (req, res) => {
+  try {
+    const { sales, businessInfo } = req.body;
+
+    if (!sales || !Array.isArray(sales) || sales.length < 3) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requieren al menos 3 ventas para dar consejos personalizados'
+      });
+    }
+
+    const totalRevenue = sales.reduce((sum, s) => sum + (s.qty * s.price), 0);
+    const productCount = {};
+    const dayCount = {};
+
+    sales.forEach(s => {
+      const date = new Date(s.date);
+      const day = date.toLocaleDateString('es-GT', { weekday: 'long' });
+      productCount[s.product] = (productCount[s.product] || 0) + s.qty;
+      dayCount[day] = (dayCount[day] || 0) + (s.qty * s.price);
+    });
+
+    const sortedDays = Object.entries(dayCount).sort((a, b) => b[1] - a[1]);
+    const weakestDay = sortedDays[sortedDays.length - 1];
+    const strongestDay = sortedDays[0];
+    const topProducts = Object.entries(productCount)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([n, q]) => `${n} (${q} u)`);
+
+    const businessName = businessInfo?.name || 'el negocio';
+    const businessType = businessInfo?.type || 'PYME';
+
+    const dataSummary = `Negocio: ${businessName} (${businessType})
+Total ventas: ${sales.length}
+Ingresos: Q ${totalRevenue.toFixed(2)}
+Día más fuerte: ${strongestDay[0]} (Q ${strongestDay[1].toFixed(2)})
+Día más débil: ${weakestDay[0]} (Q ${weakestDay[1].toFixed(2)})
+Productos top: ${topProducts.join(', ')}`;
+
+    const systemPrompt = `Eres un consultor de negocios experto en PYMES de Guatemala. Tu cliente te pide un PLAN DE ACCIÓN concreto para mejorar su negocio. Basado en sus datos reales, da 3 consejos ACCIONABLES y específicos.
+
+REGLAS:
+- Cada consejo debe ser una ACCIÓN concreta, no una observación.
+- Cada consejo debe mencionar números o datos específicos del negocio.
+- Hablá en español de Guatemala, segunda persona ("tu negocio", "podés", "intentá").
+
+FORMATO DE RESPUESTA (JSON estricto, sin markdown, sin backticks):
+{
+  "consejos": [
+    { "emoji": "🎯", "titulo": "Promoción de Lunes", "accion": "Texto detallado de la acción..." },
+    { "emoji": "📦", "titulo": "...", "accion": "..." },
+    { "emoji": "💰", "titulo": "...", "accion": "..." }
+  ]
+}
+
+Responde SOLO el JSON.`;
+
+    const aiResponse = await callGroq(systemPrompt, dataSummary, 700, 0.6);
+
+    let parsed;
+    try {
+      const cleaned = aiResponse.replace(/```json|```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      parsed = { consejos: [] };
+    }
+
+    res.json({ success: true, consejos: parsed.consejos || [], model: GROQ_MODEL });
+
+  } catch (error) {
+    console.error('[ERROR /api/consejos-negocio]', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'No se pudo generar los consejos. Intenta de nuevo.',
+      details: error.message
+    });
+  }
+});
+
+
+// ============ ENDPOINT 6: Generar imagen con Flux ============
 app.post('/api/generar-imagen', async (req, res) => {
   try {
     const { prompt } = req.body;
@@ -388,16 +552,11 @@ app.post('/api/generar-imagen', async (req, res) => {
       return res.status(400).json({ error: 'El campo prompt es obligatorio' });
     }
 
-    // Mejorar el prompt automáticamente para resultados más profesionales
     const enhancedPrompt = `${prompt}, professional food photography, instagram style, natural lighting, mouth-watering, high quality, sharp details, vibrant colors, appetizing, soft bokeh background`;
 
     const imageDataUrl = await generateImageCloudflare(enhancedPrompt);
 
-    res.json({
-      success: true,
-      image: imageDataUrl,
-      model: CF_IMAGE_MODEL
-    });
+    res.json({ success: true, image: imageDataUrl, model: CF_IMAGE_MODEL });
 
   } catch (error) {
     console.error('[ERROR /api/generar-imagen]', error.message);
@@ -420,11 +579,13 @@ app.listen(PORT, () => {
 ║    Texto:   ${GROQ_MODEL.padEnd(45)}║
 ║    Imagen:  ${(CF_IMAGE_MODEL).padEnd(45)}║
 ║                                                        ║
-║    Endpoints:                                          ║
+║    Endpoints disponibles:                              ║
 ║      GET  /api/health                                  ║
 ║      POST /api/generate                                ║
 ║      POST /api/chat                                    ║
 ║      POST /api/analizar-ventas                         ║
+║      POST /api/predecir-ventas                         ║
+║      POST /api/consejos-negocio                        ║
 ║      POST /api/generar-imagen                          ║
 ╚════════════════════════════════════════════════════════╝
   `);
